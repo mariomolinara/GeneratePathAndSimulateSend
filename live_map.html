@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CassiTrack — Mappa Live Bus (MQTT push)</title>
+
+  <!-- Leaflet: mappe open-source -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- MQTT.js: client MQTT per browser (funziona SOLO via WebSocket) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, Arial, sans-serif; }
+    #map { position: absolute; inset: 0; z-index: 0; }
+
+    /* Pannello di connessione + elenco bus live */
+    #panel {
+      position: absolute; top: 12px; right: 12px; z-index: 1000;
+      width: 320px; max-height: calc(100% - 24px); overflow: auto;
+      background: rgba(255,255,255,.96); border-radius: 10px;
+      box-shadow: 0 2px 12px rgba(0,0,0,.25); padding: 12px 14px;
+    }
+    #panel h2 { margin: 0 0 8px; font-size: 16px; }
+    label { font-size: 12px; color: #333; display: block; margin: 6px 0 2px; }
+    input { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc;
+            border-radius: 6px; font-size: 13px; }
+    .btns { display: flex; gap: 6px; margin-top: 10px; }
+    button { flex: 1; padding: 8px; border: none; border-radius: 6px; cursor: pointer;
+             font-size: 13px; color: #fff; }
+    #connectBtn { background: #2a7; }
+    #disconnectBtn { background: #888; }
+    #status { font-size: 12px; margin: 8px 0; padding: 6px 8px; border-radius: 6px;
+              background: #eee; }
+    #status.ok  { background: #dff5e1; color: #176a2e; }
+    #status.err { background: #fde2e2; color: #a11; }
+    #status.wait{ background: #fff4d6; color: #8a6d00; }
+
+    #buses { margin-top: 10px; }
+    .bus-row { display: flex; align-items: center; gap: 8px; font-size: 13px;
+               padding: 5px 6px; border-radius: 6px; border: 1px solid #eee; margin: 4px 0; }
+    .bus-row.stale { opacity: .45; }
+    .bus-row.offline { background: #fde2e2; color: #a11; opacity: 1; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; flex: none; }
+    .bus-row .info { flex: 1; }
+    .bus-row .info small { color: #555; }
+    .bus-row.offline .info small { color: #a11; }
+
+    /* Etichetta numerata del bus sulla mappa */
+    .bus-badge {
+      display: flex; align-items: center; justify-content: center;
+      width: 30px; height: 30px; border-radius: 50%;
+      color: #fff; font-weight: bold; font-size: 12px;
+      border: 2px solid #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+    }
+
+    /* Segnaposto "guasto/offline": croce rossa (nessun aggiornamento da >5 min) */
+    .bus-cross {
+      display: flex; align-items: center; justify-content: center;
+      width: 30px; height: 30px; line-height: 1;
+      color: #d11; font-weight: bold; font-size: 28px;
+      text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <h2>📡 CassiTrack — Live</h2>
+
+    <!-- ATTENZIONE: il browser NON può usare MQTT su TCP (porta 8883).
+         Serve un listener WebSocket sul broker (ws:// o wss://).
+         Sul broker risultano aperte solo 8883 (MQTT/TCP, non usabile qui) e
+         443 (nginx). Nessun endpoint WebSocket MQTT è stato confermato:
+         l'URL qui sotto è un'IPOTESI (porta 443) DA VERIFICARE/ABILITARE. -->
+    <label>URL WebSocket del broker (da verificare)</label>
+    <input id="url" value="wss://devaidalab.unicas.it/mqtt">
+
+    <label>Utente</label>
+    <input id="user" value="esp32">
+
+    <label>Password</label>
+    <input id="pass" type="password" value="UyR5rYgajGDd@hQ">
+
+    <label>Topic (sottoscrizione)</label>
+    <input id="topic" value="cassitrack/obu/#">
+
+    <label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
+      <input id="bridge" type="checkbox" style="width:auto;">
+      Bridge locale (WebSocket semplice via <code>bridge.py</code>)
+    </label>
+
+    <div class="btns">
+      <button id="connectBtn">Connetti</button>
+      <button id="disconnectBtn">Disconnetti</button>
+    </div>
+
+    <div id="status">Non connesso.</div>
+    <div id="buses"></div>
+  </div>
+
+  <script>
+  // =====================================================================
+  //  CassiTrack — Mappa live dei bus alimentata da MQTT (approccio push)
+  //
+  //  Equivalente browser di:
+  //    mosquitto_sub -h devaidalab.unicas.it -p 8883 -u esp32 -P '****' \
+  //                  -t 'cassitrack/obu/#' -v
+  //
+  //  NOTA: dal browser non si usa la porta MQTT/TCP 8883, ma un endpoint
+  //  WebSocket del broker (ws/wss). Il flusso è continuo: ad ogni messaggio
+  //  MQTT aggiorniamo il marker del bus corrispondente (nessun polling).
+  // =====================================================================
+
+  const CASSINO = [41.4901, 13.8311];
+  const map = L.map('map').setView(CASSINO, 15);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '© OpenStreetMap'
+  }).addTo(map);
+
+  const $ = (id) => document.getElementById(id);
+  function setStatus(msg, cls) {
+    const el = $('status'); el.textContent = msg; el.className = cls || '';
+  }
+
+  // Stato: un oggetto per ogni bus visto -> { marker, trail, data, lastSeen }
+  const buses = {};
+  let client = null;
+  let firstFix = true;      // per centrare la mappa sul primo bus ricevuto
+  const STALE_MS = 20000;        // dopo 20s senza messaggi il bus è "stale" (attenuato)
+  const OFFLINE_MS = 5 * 60000;  // dopo 5 min senza messaggi -> guasto: croce rossa
+
+  // Colore stabile ricavato dall'id del bus (hash -> tonalità)
+  function colorFor(id) {
+    let h = 0;
+    for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
+    return `hsl(${h},70%,45%)`;
+  }
+
+  // Icona numerata: dal nome BUS12 estraggo "12"
+  function badgeIcon(id, color) {
+    const num = (id.match(/\d+/) || [id])[0];
+    return L.divIcon({
+      className: '',
+      html: `<div class="bus-badge" style="background:${color}">${num}</div>`,
+      iconSize: [30, 30], iconAnchor: [15, 15]
+    });
+  }
+
+  // Icona "guasto/offline": croce rossa (nessun aggiornamento da oltre 5 min)
+  function crossIcon() {
+    return L.divIcon({
+      className: '',
+      html: `<div class="bus-cross">✖</div>`,
+      iconSize: [30, 30], iconAnchor: [15, 15]
+    });
+  }
+
+  // --- Aggiorna (o crea) il bus alla ricezione di un messaggio ---
+  function updateBus(id, d) {
+    const pos = [d.lat, d.lon];
+    let b = buses[id];
+    if (!b) {
+      const color = colorFor(id);
+      b = buses[id] = {
+        color,
+        marker: L.marker(pos, { icon: badgeIcon(id, color) }).addTo(map),
+        trail: L.polyline([pos], { color, weight: 3, opacity: .6 }).addTo(map),
+        data: d, lastSeen: Date.now(), offline: false
+      };
+      b.marker.bindTooltip(id, { permanent: false, direction: 'top' });
+    } else {
+      b.marker.setLatLng(pos);
+      const pts = b.trail.getLatLngs();
+      pts.push(L.latLng(pos));
+      if (pts.length > 60) pts.shift();     // scia limitata agli ultimi punti
+      b.trail.setLatLngs(pts);
+      b.data = d; b.lastSeen = Date.now();
+    }
+    // Il bus torna a trasmettere: ripristina il segnaposto normale
+    if (b.offline) { b.marker.setIcon(badgeIcon(id, b.color)); b.offline = false; }
+    // Tooltip con la telemetria
+    b.marker.setTooltipContent(
+      `<b>${id}</b><br>` +
+      `vel: ${d.spd ?? '?'} km/h · rotta: ${d.hdg ?? '?'}°<br>` +
+      `occ: ${d.occ ?? '?'} passeggeri`
+    );
+
+    if (firstFix) { map.setView(pos, 15); firstFix = false; }
+    renderBusList();
+  }
+
+  // --- Rileva i bus fermi da troppo tempo -> segnaposto a croce rossa ---
+  function markOffline() {
+    const now = Date.now();
+    Object.keys(buses).forEach(id => {
+      const b = buses[id];
+      const off = (now - b.lastSeen) > OFFLINE_MS;
+      if (off && !b.offline) {                 // appena diventato offline
+        b.offline = true;
+        b.marker.setIcon(crossIcon());
+      }
+      if (b.offline) {                          // aggiorna il tempo di silenzio
+        const min = Math.round((now - b.lastSeen) / 60000);
+        b.marker.setTooltipContent(`<b>${id}</b><br>⚠ nessun segnale da ${min} min`);
+      }
+    });
+  }
+
+  // --- Elenco laterale dei bus attivi ---
+  function renderBusList() {
+    const now = Date.now();
+    const box = $('buses');
+    box.innerHTML = '<b>Bus attivi: ' + Object.keys(buses).length + '</b>';
+    Object.keys(buses).sort().forEach(id => {
+      const b = buses[id];
+      const stale = (now - b.lastSeen) > STALE_MS;
+      const row = document.createElement('div');
+      row.className = 'bus-row' + (b.offline ? ' offline' : (stale ? ' stale' : ''));
+      const info = b.offline
+        ? '⚠ nessun segnale (&gt;5 min)'
+        : `${b.data.spd ?? '?'} km/h · occ ${b.data.occ ?? '?'}`;
+      row.innerHTML =
+        `<span class="dot" style="background:${b.offline ? '#d11' : b.color}"></span>` +
+        `<span class="info"><b>${id}</b><br><small>${info}</small></span>`;
+      row.addEventListener('click', () => map.panTo(b.marker.getLatLng()));
+      box.appendChild(row);
+    });
+  }
+  // Aggiorna periodicamente lo stato (stale/offline) anche senza nuovi messaggi
+  setInterval(() => { markOffline(); renderBusList(); }, 3000);
+
+  // Parser comune: riceve una stringa JSON e aggiorna il bus corrispondente.
+  // Usato sia dal client MQTT sia dal bridge WebSocket.
+  function handleData(topic, payloadStr) {
+    let d;
+    try { d = JSON.parse(payloadStr); }
+    catch { return; }                          // ignora payload non-JSON
+    // id dal payload, altrimenti dal topic cassitrack/obu/BUS#/pos
+    const id = d.id || (topic.split('/')[2]);
+    if (!id || typeof d.lat !== 'number' || typeof d.lon !== 'number') return;
+    updateBus(id, d);
+  }
+
+  // Dispatcher: sceglie la modalità in base alla checkbox "Bridge locale".
+  function connect() {
+    if ($('bridge').checked) connectBridge();
+    else connectMqtt();
+  }
+
+  // ============ Modalità A: MQTT diretto via WebSocket (ws/wss) ============
+  const MAX_ATTEMPTS = 4;      // dopo N tentativi falliti smetto di ritentare
+  let attempts = 0;            // tentativi dall'ultimo "Connetti"
+  let connected = false;       // true se almeno una connessione è riuscita
+
+  function connectMqtt() {
+    disconnect();
+    attempts = 0; connected = false;
+    const url = $('url').value.trim();
+    setStatus('Connessione a ' + url + ' …', 'wait');
+    try {
+      client = mqtt.connect(url, {
+        username: $('user').value,
+        password: $('pass').value,
+        reconnectPeriod: 3000,       // riconnessione automatica
+        connectTimeout: 8000
+      });
+    } catch (e) {
+      setStatus('URL non valido: ' + e.message, 'err');
+      return;
+    }
+
+    client.on('connect', () => {
+      connected = true; attempts = 0;
+      const topic = $('topic').value.trim();
+      client.subscribe(topic, (err) => {
+        if (err) setStatus('Errore sottoscrizione: ' + err.message, 'err');
+        else setStatus('Connesso ✓ — in ascolto su ' + topic, 'ok');
+      });
+    });
+
+    // Ad ogni messaggio: delego al parser comune (PUSH)
+    client.on('message', (topic, payload) => handleData(topic, payload.toString()));
+
+    client.on('error', (err) => setStatus('Errore MQTT: ' + (err.message || err), 'err'));
+
+    // 'reconnect' scatta prima di ogni nuovo tentativo: conto i fallimenti e,
+    // se non ci si è mai connessi, dopo MAX_ATTEMPTS mi fermo con una diagnosi.
+    client.on('reconnect', () => {
+      attempts++;
+      if (!connected && attempts >= MAX_ATTEMPTS) {
+        const url = $('url').value.trim();
+        disconnect();
+        setStatus('Impossibile connettersi a ' + url + ' dopo ' + MAX_ATTEMPTS +
+          ' tentativi. Verifica che il broker esponga un endpoint WebSocket ' +
+          '(ws/wss) valido e raggiungibile: il browser non può usare la porta ' +
+          'MQTT/TCP 8883.', 'err');
+      } else {
+        setStatus('Riconnessione… (tentativo ' + attempts + '/' + MAX_ATTEMPTS + ')', 'wait');
+      }
+    });
+
+    client.on('close', () => {
+      if (!connected && attempts < MAX_ATTEMPTS) setStatus('Connessione non riuscita, ritento…', 'wait');
+      else if (connected) setStatus('Connessione chiusa.', 'err');
+    });
+  }
+
+  // ============ Modalità B: bridge locale (WebSocket semplice) ============
+  // Si collega a bridge.py, che inoltra i messaggi come {topic, payload}.
+  let ws = null;
+  function connectBridge() {
+    disconnect();
+    const url = $('url').value.trim();
+    setStatus('Connessione al bridge ' + url + ' …', 'wait');
+    try { ws = new WebSocket(url); }
+    catch (e) { setStatus('URL non valido: ' + e.message, 'err'); return; }
+
+    ws.onopen = () => setStatus('Connesso al bridge ✓ — in attesa dei dati', 'ok');
+    ws.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);         // { topic, payload }
+        handleData(m.topic || '', m.payload);
+      } catch { /* messaggio non valido: ignora */ }
+    };
+    ws.onerror = () => setStatus('Errore: bridge non raggiungibile. È in esecuzione bridge.py?', 'err');
+    ws.onclose = () => { if (ws) setStatus('Bridge disconnesso.', 'err'); };
+  }
+
+  function disconnect() {
+    if (client) { client.end(true); client = null; }
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    setStatus('Non connesso.', '');
+  }
+
+  // Cambiando modalità, propongo l'URL di default adatto
+  $('bridge').addEventListener('change', (e) => {
+    $('url').value = e.target.checked
+      ? 'ws://localhost:8081'
+      : 'wss://devaidalab.unicas.it/mqtt';
+  });
+
+  $('connectBtn').addEventListener('click', connect);
+  $('disconnectBtn').addEventListener('click', disconnect);
+  </script>
+</body>
+</html>
