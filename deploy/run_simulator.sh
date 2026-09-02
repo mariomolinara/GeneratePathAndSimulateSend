@@ -7,7 +7,7 @@
 #
 # Variabili d'ambiente opzionali:
 #   SIM_PYTHON  interprete Python        (default: <progetto>/.venv/bin/python)
-#   SIM_JSON    file dei percorsi        (default: percorsiCassino.json)
+#   SIM_JSON    file dei percorsi        (default: percorsiCassinoSettembre2026.json)
 #   SIM_ARGS    argomenti extra          (es. "--insecure --send-interval 30")
 #   SIM_LOCK    file di lock             (default: /tmp/cassitrack-sim.lock)
 # ---------------------------------------------------------------------------

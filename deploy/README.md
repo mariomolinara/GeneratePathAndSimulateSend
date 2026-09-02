@@ -23,9 +23,9 @@ Sulla macchina Linux, dentro la cartella del progetto:
 # se i file arrivano da Windows, normalizza una volta i fine-riga:
 sudo apt-get install -y dos2unix && dos2unix deploy/*.sh   # oppure: sed -i 's/\r$//' deploy/*.sh
 
-sudo ./deploy/install_service.sh                       # usa percorsiCassino.json
+sudo ./deploy/install_service.sh                       # usa percorsiCassinoSettembre2026.json
 # oppure specificando file e argomenti extra:
-sudo ./deploy/install_service.sh percorsiCassino.json --insecure
+sudo ./deploy/install_service.sh percorsiCassinoSettembre2026.json --insecure
 ```
 
 Il servizio si chiama **`cassitrack-sim`**.

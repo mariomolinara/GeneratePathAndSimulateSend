@@ -235,6 +235,6 @@ README.md         Questo file
 Per far partire il simulatore ad ogni riavvio della macchina, in background e con istanza
 singola, installa il servizio systemd:
 ```bash
-sudo ./deploy/install_service.sh percorsiCassino.json
+sudo ./deploy/install_service.sh percorsiCassinoSettembre2026.json
 ```
 Dettagli e comandi di gestione in [`deploy/README.md`](deploy/README.md).

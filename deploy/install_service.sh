@@ -9,7 +9,7 @@
 #   sudo ./deploy/install_service.sh [file.json] [args extra...]
 # Esempi:
 #   sudo ./deploy/install_service.sh
-#   sudo ./deploy/install_service.sh percorsiCassino.json --insecure
+#   sudo ./deploy/install_service.sh percorsiCassinoSettembre2026.json --insecure
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -24,7 +24,11 @@ fi
 # Percorsi e utente ---------------------------------------------------------
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_USER="${SUDO_USER:-root}"
-JSON="${1:-percorsiCassino.json}"
+# I percorsi di settembre 2026 sono gli unici coperti da vehicle_ids.json:
+# percorsiCassino.json contiene solo quattro tracciati, e il suo BUS2L coincide
+# con l'antenna fisica. Lanciare l'installer senza argomento deve quindi dare
+# la configurazione buona, non quella storica.
+JSON="${1:-percorsiCassinoSettembre2026.json}"
 shift || true
 EXTRA_ARGS="$*"                       # eventuali argomenti extra (es. --insecure)
 
