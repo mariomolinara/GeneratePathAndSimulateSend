@@ -50,6 +50,7 @@ Basato sulla riga di riferimento:
 
 import argparse
 import csv
+import datetime
 import json
 import math
 import random
@@ -57,6 +58,7 @@ import ssl
 import sys
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import paho.mqtt.client as mqtt
 
@@ -148,15 +150,23 @@ def path_length(points):
                for i in range(len(points) - 1))
 
 
-def seconds_of_day():
-    """Secondi trascorsi da mezzanotte, ora locale della macchina.
+#: Il fuso del servizio simulato. NON e' quello della macchina.
+SERVICE_TZ = ZoneInfo("Europe/Rome")
 
-    E' la stessa base oraria che usa CassiTrack per decidere quale corsa e' in
-    servizio (LocalTime.now(Europe/Rome)): se le due macchine hanno lo stesso
-    fuso, un veicolo che parte all'orario di tabella viene riconosciuto subito.
+
+def seconds_of_day():
+    """Secondi trascorsi da mezzanotte, ora di Cassino.
+
+    Il fuso e' fissato a Europe/Rome perche' e' quello con cui CassiTrack
+    decide quale corsa e' in servizio (LocalTime.now(Europe/Rome)). Leggere
+    invece l'ora locale della macchina sembra equivalente e non lo e': il
+    server di produzione gira in UTC, quindi il simulatore percorreva le corse
+    delle 18:30 mentre il backend gli assegnava quelle delle 20:00. Nessuno dei
+    due sbagliava da solo; sbagliavano insieme, e il risultato erano corse mai
+    concluse, previsioni con orari gia' passati e ritardi a due cifre.
     """
-    lt = time.localtime()
-    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+    now = datetime.datetime.now(SERVICE_TZ)
+    return now.hour * 3600 + now.minute * 60 + now.second
 
 
 # ------------------------------------------------------------------ #
