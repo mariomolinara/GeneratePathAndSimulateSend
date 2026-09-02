@@ -180,10 +180,16 @@ def load_id_map(path):
     corsa in servizio. Senza questa traduzione il backend non riconosce il
     veicolo e mostra il mezzo senza linea ne' fermate.
 
-    Un valore null significa "non simulare questo percorso": e' il caso della
-    linea 01, servita dalle antenne fisiche BUS1/BUS2, che trasmettono davvero
-    su quegli id. Simularla in parallelo farebbe scrivere due sorgenti diverse
-    sullo stesso veicolo.
+    Il valore puo' essere una lista: lo stesso tracciato viene allora percorso
+    da PIU' veicoli, ciascuno con il proprio orario. Serve alle linee ad anello,
+    che nel servizio reale sono coperte da due mezzi sfasati di mezz'ora mentre
+    il file dei percorsi ne descrive il tracciato una volta sola; senza, una
+    corsa su due resterebbe senza autobus.
+
+    Un valore null significa "non simulare questo percorso". Nessuno lo usa
+    oggi: l'unica antenna fisica trasmette come BUS2L, che non collide con gli
+    id della flotta. Andra' rimesso sul mezzo corrispondente il giorno in cui
+    quell'unita' verra' riflashata con un id del registro.
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -601,12 +607,16 @@ def main():
             continue
         sid = spec["id"]
         # La mappa e' esplicita: un id assente resta invariato, un id associato
-        # a null e' un percorso che NON va simulato (lo coprono le antenne vere).
+        # a null e' un percorso che NON va simulato, una lista significa piu'
+        # veicoli sullo stesso tracciato.
         if sid in id_map and not id_map[sid]:
             esclusi.append(sid)
             continue
-        pub_id = id_map.get(sid) or sid
-        buses.append(Bus(spec, pub_id=pub_id, trips=schedule.get(pub_id)))
+        pub_ids = id_map.get(sid) or sid
+        if isinstance(pub_ids, str):
+            pub_ids = [pub_ids]
+        for pub_id in pub_ids:
+            buses.append(Bus(spec, pub_id=pub_id, trips=schedule.get(pub_id)))
 
     if not buses:
         print("Nessun bus valido nel file (servono almeno 2 punti per linea).")

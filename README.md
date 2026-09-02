@@ -112,10 +112,16 @@ ragiona invece per **veicolo** (`BUS1`…`BUS37`) e usa l'id ricevuto per risali
 e quindi alla corsa in servizio. Senza traduzione 23 percorsi su 30 non venivano
 riconosciuti, e i 7 che combaciavano per omonimia comparivano sulla linea sbagliata.
 
-`vehicle_ids.json` contiene la corrispondenza. Due voci valgono `null` — `BUS01` e
-`BUS01R` — perché la linea 01 è servita dalle **antenne fisiche** `BUS1`/`BUS2`, che
-trasmettono davvero su quegli id: simularla in parallelo farebbe scrivere due sorgenti
-diverse sullo stesso veicolo.
+`vehicle_ids.json` contiene la corrispondenza, e copre tutti e **37 i mezzi** del
+registro. Il valore può essere una **lista**: lo stesso tracciato viene allora percorso
+da più veicoli, ciascuno col proprio orario. Serve alle linee ad anello, che nel servizio
+reale sono coperte da due mezzi sfasati di mezz'ora mentre il file dei percorsi ne
+descrive il tracciato una volta sola — senza, una corsa su due resterebbe senza autobus.
+
+Un valore `null` significa "non simulare questo percorso". Oggi non lo usa nessuno:
+l'unica antenna fisica trasmette come `BUS2L`, che non collide con gli id della flotta.
+Andrà rimesso sul mezzo corrispondente il giorno in cui quell'unità verrà riflashata
+con un id del registro.
 
 ### Perché un invio ogni 10 secondi
 CassiTrack registra il passaggio a una fermata solo se riceve una posizione **entro 80 m**
