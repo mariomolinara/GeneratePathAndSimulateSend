@@ -90,8 +90,42 @@ Se il certificato TLS del broker non è verificabile sul tuo sistema:
 python simulate_bus.py percorso1.json --insecure
 ```
 
+### Modalità orario (attiva per impostazione predefinita)
+Se nella cartella sono presenti `vehicle_ids.json` e `corse_per_bus.csv` — entrambi
+inclusi nel progetto — la simulazione segue il **servizio reale di CassiTrack** invece
+di girare a vuoto:
+
+- ogni veicolo **parte agli orari di tabella**, percorre il tracciato nel verso della
+  corsa e **attende al capolinea** fino alla partenza successiva, continuando a
+  trasmettere (in quell'intervallo CassiTrack lo mostra fuori servizio, ed è corretto);
+- la **velocità non è più fissa**: è quella che serve a coprire il tracciato nel tempo
+  previsto dall'orario, tolte le soste e il tempo mediamente perso nel traffico. I
+  ritardi che CassiTrack misura nascono così dalle condizioni di marcia e non da una
+  taratura arbitraria — lo scarto medio rilevato in prova è di circa ±1 minuto;
+- gli **id trasmessi sono quelli della flotta CassiTrack**, tradotti da `vehicle_ids.json`.
+
+Per tornare al comportamento storico basta `--free-running`.
+
+### Perché gli id vanno tradotti
+Gli id dei percorsi (`BUS02R`, `BUSAGRR`, `BUS11L`) sono nomi di **linea**; CassiTrack
+ragiona invece per **veicolo** (`BUS1`…`BUS37`) e usa l'id ricevuto per risalire al mezzo
+e quindi alla corsa in servizio. Senza traduzione 23 percorsi su 30 non venivano
+riconosciuti, e i 7 che combaciavano per omonimia comparivano sulla linea sbagliata.
+
+`vehicle_ids.json` contiene la corrispondenza. Due voci valgono `null` — `BUS01` e
+`BUS01R` — perché la linea 01 è servita dalle **antenne fisiche** `BUS1`/`BUS2`, che
+trasmettono davvero su quegli id: simularla in parallelo farebbe scrivere due sorgenti
+diverse sullo stesso veicolo.
+
+### Perché un invio ogni 10 secondi
+CassiTrack registra il passaggio a una fermata solo se riceve una posizione **entro 80 m**
+da essa. A 25 km/h un invio al minuto copre 417 m: la finestra utile di 160 m veniva
+saltata circa una volta su tre, e il mezzo risultava fuori percorso. Misurato su quattro
+linee, passando da 60 s a 10 s le fermate agganciate salgono da **23 su 30 a 30 su 30**.
+
 ### Cosa fa la simulazione
-- Ogni bus percorre il proprio tracciato **avanti e indietro** (capolinea).
+- In modalità orario ogni bus **segue il tabellario**; senza orario percorre il proprio
+  tracciato **avanti e indietro** (capolinea), come in origine.
 - Velocità di crociera tipica urbana **~25 km/h**, con lieve variabilità.
 - **Sosta ~30 s** (con variabilità) a ogni fermata.
 - Ogni tanto resta **bloccato nel traffico** (velocità 0 per alcuni secondi).
@@ -111,6 +145,27 @@ Ricalca la riga `mosquitto_pub` fornita:
 ### Parametri regolabili
 In cima a `simulate_bus.py` puoi modificare: `CRUISE_KMH`, `STOP_DWELL`, `TRAFFIC_PROB`,
 `UPDATE_HZ`, `CAPACITY`, ecc.
+
+Dalla riga di comando:
+
+| opzione | effetto |
+|---|---|
+| `--send-interval SEC` | secondi fra due invii per bus (default **10**) |
+| `--schedule FILE` | tabellario da rispettare (default `corse_per_bus.csv`) |
+| `--id-map FILE` | traduzione id percorso → veicolo (default `vehicle_ids.json`) |
+| `--free-running` | ignora l'orario: marcia continua, comportamento originale |
+| `--dry-run` | simula e stampa senza connettersi al broker |
+| `--broker`, `--port`, `--user`, `--password`, `--no-tls` | punta a un broker diverso, es. un'installazione locale di CassiTrack |
+| `--cruise-kmh`, `--terminal-dwell`, `--sim-step`, `--insecure` | come prima |
+
+### I due file di dati
+| file | contenuto |
+|---|---|
+| `vehicle_ids.json` | id del percorso → id del veicolo nella flotta CassiTrack (`null` = non simulare) |
+| `corse_per_bus.csv` | tabellario esportato dal database CassiTrack: 1048 corse con partenza e arrivo in secondi da mezzanotte |
+
+Entrambi sono estratti dallo schema v28 di CassiTrack. Se il servizio cambia, basta
+riesportarli: lo script non contiene orari cablati.
 
 ---
 

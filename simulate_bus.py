@@ -7,6 +7,17 @@ Simula in modo continuo e realistico gli autobus definiti in un file
 percorsoX.json (creato dall'interfaccia web CassiTrack) e ne invia la
 posizione via MQTT (TLS) al broker cassitrack.
 
+Modalita' "orario" (attiva quando esiste corse_per_bus.csv):
+  * ogni veicolo segue il tabellario reale di CassiTrack invece di andare
+    avanti e indietro senza sosta: parte agli orari previsti, percorre il
+    tracciato nel verso della corsa e attende al capolinea fino alla corsa
+    successiva;
+  * la velocita' non e' piu' fissa: e' quella che serve a coprire il percorso
+    nel tempo previsto dall'orario, cosi' ritardi e anticipi nascono dal
+    traffico e dalle soste, non da una taratura arbitraria;
+  * gli id trasmessi sono tradotti in quelli della flotta CassiTrack tramite
+    vehicle_ids.json: il backend riconosce il veicolo e gli assegna la corsa.
+
 Caratteristiche della simulazione:
   * ogni bus percorre il proprio tracciato avanti e indietro (capolinea);
   * velocita' tipica da bus urbano (~25 km/h), con piccola variabilita';
@@ -38,6 +49,7 @@ Basato sulla riga di riferimento:
 """
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -62,7 +74,12 @@ TOPIC_TMPL = "cassitrack/obu/{bus}/pos"     # {bus} = BUS#  (es. BUS12)
 # ------------------------------------------------------------------ #
 CRUISE_KMH     = 25.0     # velocita' di crociera tipica di un bus urbano
 SPEED_JITTER   = 0.15     # +/- 15% di variabilita' sulla velocita'
-SEND_INTERVAL  = 60.0     # intervallo minimo tra due invii MQTT per bus (s) = 1/min
+SEND_INTERVAL  = 10.0     # intervallo minimo tra due invii MQTT per bus (s)
+# Perche' 10 e non 60: CassiTrack registra il passaggio a una fermata solo se
+# riceve una posizione entro 80 m da essa. A 25 km/h un invio al minuto copre
+# 417 m, quindi la finestra utile di 160 m veniva saltata una volta su tre e il
+# mezzo risultava "fuori percorso". A 10 s il passo scende a ~69 m e la fermata
+# non puo' sfuggire.
 SIM_STEP       = 1.0      # passo di integrazione interno della simulazione (s)
 TERMINAL_DWELL = 180.0    # sosta ai capolinea prima dell'inversione (s) = 3 min
 STOP_DWELL     = 30.0     # sosta media alle fermate intermedie (secondi)
@@ -78,6 +95,11 @@ BREAKDOWN_MTBF = 86400.0  # tempo medio tra due rotture per bus (s) ~ 24 h
 BREAKDOWN_DUR  = 600.0    # durata di una rottura: nessun invio (s) = 10 min
 
 R_EARTH = 6371000.0       # raggio terrestre medio (m)
+
+ID_MAP_FILE   = "vehicle_ids.json"   # id del JSON -> id del veicolo in CassiTrack
+SCHEDULE_FILE = "corse_per_bus.csv"  # tabellario esportato dal database CassiTrack
+MIN_TRIP_KMH  = 5.0       # limiti di sicurezza sulla velocita' dedotta dall'orario
+MAX_TRIP_KMH  = 70.0
 
 
 # ------------------------------------------------------------------ #
@@ -106,22 +128,112 @@ def interp(a, b, f):
     return (a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f)
 
 
+def quota_in_moto():
+    """Frazione del tempo in cui il bus e' davvero in movimento.
+
+    Fra un ingorgo e l'altro passano in media 1/TRAFFIC_PROB secondi di marcia
+    e ogni ingorgo dura in media (TRAFFIC_MIN+TRAFFIC_MAX)/2. Chi segue un
+    orario deve correre un po' piu' veloce per assorbirli: senza questa
+    correzione ogni corsa arriverebbe in ritardo del 30% per costruzione, e il
+    ritardo misurato da CassiTrack non direbbe piu' nulla sul traffico reale.
+    """
+    fra_ingorghi = 1.0 / max(TRAFFIC_PROB, 1e-9)
+    durata_media = (TRAFFIC_MIN + TRAFFIC_MAX) / 2.0
+    return fra_ingorghi / (fra_ingorghi + durata_media)
+
+
+def path_length(points):
+    """Lunghezza complessiva del tracciato, in metri."""
+    return sum(haversine(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
+               for i in range(len(points) - 1))
+
+
+def seconds_of_day():
+    """Secondi trascorsi da mezzanotte, ora locale della macchina.
+
+    E' la stessa base oraria che usa CassiTrack per decidere quale corsa e' in
+    servizio (LocalTime.now(Europe/Rome)): se le due macchine hanno lo stesso
+    fuso, un veicolo che parte all'orario di tabella viene riconosciuto subito.
+    """
+    lt = time.localtime()
+    return lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+
+
+# ------------------------------------------------------------------ #
+#  Identita' dei veicoli e tabellario                                #
+# ------------------------------------------------------------------ #
+def load_id_map(path):
+    """id del percorso (BUS02R) -> id del veicolo nella flotta CassiTrack (BUS6).
+
+    Gli id del file dei percorsi sono nomi di LINEA; CassiTrack ragiona invece
+    per VEICOLO (BUS1..BUS37) e usa l'id per risalire al mezzo e quindi alla
+    corsa in servizio. Senza questa traduzione il backend non riconosce il
+    veicolo e mostra il mezzo senza linea ne' fermate.
+
+    Un valore null significa "non simulare questo percorso": e' il caso della
+    linea 01, servita dalle antenne fisiche BUS1/BUS2, che trasmettono davvero
+    su quegli id. Simularla in parallelo farebbe scrivere due sorgenti diverse
+    sullo stesso veicolo.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def load_schedule(path):
+    """vehicle_id -> lista di corse (partenza, arrivo, linea), in ordine di orario.
+
+    Il file e' l'esportazione del tabellario di CassiTrack: una riga per corsa,
+    con l'ora di partenza e di arrivo in secondi da mezzanotte.
+    """
+    corse = {}
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                corse.setdefault(row["vehicle_id"], []).append({
+                    "trip_id":  row["trip_id"],
+                    "route_id": row["route_id"],
+                    "start":    int(row["partenza_sec"]),
+                    "end":      int(row["arrivo_sec"]),
+                    # I percorsi di ritorno hanno la geometria memorizzata nel
+                    # verso dell'andata: vanno percorsi a ritroso.
+                    "reverse":  row["route_id"].endswith("_R"),
+                })
+    except FileNotFoundError:
+        return {}
+    for v in corse.values():
+        v.sort(key=lambda c: c["start"])
+    return corse
+
+
 # ------------------------------------------------------------------ #
 #  Modello del singolo autobus                                       #
 # ------------------------------------------------------------------ #
 class Bus:
-    def __init__(self, spec):
-        self.id = spec["id"]                       # es. "BUS3"
-        self.topic = TOPIC_TMPL.format(bus=self.id)
+    def __init__(self, spec, pub_id=None, trips=None):
+        self.id = spec["id"]                       # es. "BUS02R" (nome del percorso)
+        self.pub_id = pub_id or self.id            # es. "BUS6"   (veicolo CassiTrack)
+        self.topic = TOPIC_TMPL.format(bus=self.pub_id)
         # tracciato: lista di (lat, lon, e' una fermata?)
         self.points = [(p["lat"], p["lon"], bool(p.get("stop", False)))
                        for p in spec["points"]]
+
+        # --- orario di servizio (vuoto = marcia continua, comportamento storico) ---
+        self.trips = trips or []
+        self.trip = None                           # corsa in corso, None se in attesa
+        self.trip_speed = None                     # m/s dedotti dall'orario
+        self.length = path_length(self.points)     # metri di tracciato
+        self.n_stops = sum(1 for p in self.points[1:-1] if p[2])
 
         # stato del movimento
         self.node = 0            # indice del nodo di partenza del segmento
         self.frac = 0.0          # avanzamento sul segmento corrente [0,1]
         self.direction = 1       # +1 = avanti, -1 = ritorno (capolinea)
-        self.state = "run"       # "run" | "dwell" (fermata) | "traffic"
+        self.state = "attesa" if self.trips else "run"
+        # "run" | "dwell" (fermata) | "traffic" | "terminal" | "broken"
+        # | "attesa" (in orario: fermo al capolinea fino alla partenza)
         self.timer = 0.0         # secondi rimanenti di sosta/blocco
 
         # telemetria
@@ -181,6 +293,75 @@ class Bus:
                 return st
         return None
 
+    # --- corsa da iniziare adesso, secondo il tabellario ---
+    def _corsa_corrente(self, now):
+        """La corsa che questo veicolo dovrebbe star facendo in questo momento."""
+        for c in self.trips:
+            if c["start"] <= now <= c["end"]:
+                return c
+        return None
+
+    def _posiziona(self, frazione):
+        """Porta il bus alla frazione indicata del tracciato, dal capolinea di
+        partenza della corsa in corso.
+
+        Serve quando il simulatore viene avviato (o riavviato) a corsa gia'
+        iniziata: il mezzo si aggancia dove l'orario dice che dovrebbe essere,
+        invece di partire dal capolinea con mezz'ora di ritardo inventata.
+        """
+        da_percorrere = max(0.0, min(1.0, frazione)) * self.length
+        while da_percorrere > 0:
+            nb = self.node + self.direction
+            if nb < 0 or nb >= len(self.points):
+                return
+            a, b = self.points[self.node], self.points[nb]
+            seg = haversine(a[0], a[1], b[0], b[1])
+            if seg <= 1e-6:
+                self.node, self.frac = nb, 0.0
+                continue
+            if da_percorrere < seg:
+                self.frac = da_percorrere / seg
+                return
+            da_percorrere -= seg
+            self.node, self.frac = nb, 0.0
+
+    def _inizia_corsa(self, corsa):
+        """Porta il bus al capolinea di partenza e ne calcola la velocita'.
+
+        La velocita' non e' un parametro fisso ma quella che serve a coprire il
+        tracciato nel tempo previsto dall'orario, tolte le soste alle fermate.
+        Cosi' il mezzo arriva in orario quando tutto va bene, e i ritardi che
+        CassiTrack misura nascono davvero dal traffico e dalle soste lunghe.
+        """
+        self.trip = corsa
+        durata = max(60.0, corsa["end"] - corsa["start"])
+        marcia = max(60.0, durata - self.n_stops * STOP_DWELL)
+        v = self.length / (marcia * quota_in_moto())   # m/s
+        self.trip_speed = min(MAX_TRIP_KMH / 3.6, max(MIN_TRIP_KMH / 3.6, v))
+        if corsa["reverse"]:
+            self.node, self.direction = len(self.points) - 1, -1
+        else:
+            self.node, self.direction = 0, +1
+        self.frac = 0.0
+        # Avvio a corsa gia' iniziata: aggancio nel punto previsto dall'orario.
+        trascorso = seconds_of_day() - corsa["start"]
+        if trascorso > 0:
+            self._posiziona(trascorso / durata)
+        self.state = "run"
+
+    def _termina_corsa(self):
+        """Arrivato al capolinea: rilascia la corsa e attende la successiva.
+
+        Il bus resta fermo dov'e' e continua a trasmettere. CassiTrack lo
+        mostrera' senza corsa fino alla partenza successiva, ed e' corretto:
+        in quell'intervallo il mezzo non e' in servizio.
+        """
+        self.trip = None
+        self.trip_speed = None
+        self.state = "attesa"
+        self.spd = 0.0
+        self._boarding()
+
     # --- variazione passeggeri alla ripartenza da fermata/capolinea ---
     def _boarding(self):
         # I passeggeri cambiano SOLO alle fermate, in modo graduale (piccoli
@@ -212,6 +393,15 @@ class Bus:
             self.spd = 0.0
             return
 
+        # --- in orario: fermo al capolinea finche' non e' l'ora di partire ---
+        if self.trips and self.trip is None:
+            corsa = self._corsa_corrente(seconds_of_day())
+            if corsa is None:
+                self.state = "attesa"
+                self.spd = 0.0
+                return
+            self._inizia_corsa(corsa)
+
         if self.state == "dwell":                  # sosta a fermata intermedia
             self.spd = 0.0
             self.timer -= dt
@@ -234,13 +424,18 @@ class Bus:
                 self.state = "run"
 
         else:  # "run"
-            if random.random() < TRAFFIC_PROB:     # ingorgo casuale
+            # Probabilita' PER SECONDO, non per passo: con --sim-step 0.5 il
+            # traffico raddoppiava senza che nulla lo giustificasse.
+            if random.random() < TRAFFIC_PROB * dt:  # ingorgo casuale
                 self.state = "traffic"
                 self.timer = random.uniform(TRAFFIC_MIN, TRAFFIC_MAX)
                 self.spd = 0.0
                 return
 
-            v = (CRUISE_KMH / 3.6) * (1 + random.uniform(-SPEED_JITTER, SPEED_JITTER))  # m/s
+            # In orario la velocita' viene dalla corsa; senza orario resta quella
+            # di crociera configurata.
+            base = self.trip_speed if self.trip_speed else (CRUISE_KMH / 3.6)
+            v = base * (1 + random.uniform(-SPEED_JITTER, SPEED_JITTER))     # m/s
             prev = self.position()
             status = self.advance(v * dt)
             cur = self.position()
@@ -249,10 +444,13 @@ class Bus:
             if moved > 0.1:
                 self.hdg = bearing(prev[0], prev[1], cur[0], cur[1])
 
-            if status == "terminal":               # capolinea -> sosta lunga + inversione
-                self.state = "terminal"
-                self.timer = TERMINAL_DWELL
-                self.spd = 0.0
+            if status == "terminal":
+                if self.trips:                     # in orario: la corsa finisce qui
+                    self._termina_corsa()
+                else:                              # marcia continua: sosta e inverti
+                    self.state = "terminal"
+                    self.timer = TERMINAL_DWELL
+                    self.spd = 0.0
             elif status == "dwell":                # fermata intermedia -> sosta breve
                 self.state = "dwell"
                 self.timer = max(5.0, STOP_DWELL + random.uniform(-STOP_JITTER, STOP_JITTER))
@@ -262,7 +460,7 @@ class Bus:
     def payload(self):
         lat, lon = self.position()
         return {
-            "id":   self.id,
+            "id":   self.pub_id,
             "ts":   int(time.time()),
             "lat":  round(lat, 6),
             "lon":  round(lon, 6),
@@ -294,9 +492,11 @@ def run_bus(bus, client):
     ("broken") il bus non invia nulla, simulando un'interruzione."""
     def publish():
         msg = json.dumps(bus.payload())
-        client.publish(bus.topic, msg)
-        print(f"[{bus.id:>6}] {bus.state:<8} spd={bus.spd:5.1f} km/h "
-              f"occ={bus.occ:<2} -> {bus.topic}")
+        if client is not None:
+            client.publish(bus.topic, msg)
+        corsa = bus.trip["trip_id"] if bus.trip else "-"
+        print(f"[{bus.id:>8} -> {bus.pub_id:>6}] {bus.state:<8} spd={bus.spd:5.1f} km/h "
+              f"occ={bus.occ:<2} corsa={corsa}")
 
     since_publish = 0.0
     # primo invio sfasato a caso nell'intervallo: i bus non partono sincronizzati
@@ -312,13 +512,15 @@ def run_bus(bus, client):
         _stop.wait(SIM_STEP)
 
 
-def make_client(insecure):
+def make_client(insecure, user=None, password=None, tls=True):
     # compatibile sia con paho-mqtt 1.x sia 2.x
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
     except (AttributeError, TypeError):
         client = mqtt.Client()
-    client.username_pw_set(USER, PASSWORD)
+    client.username_pw_set(user or USER, password if password is not None else PASSWORD)
+    if not tls:
+        return client                               # broker locale in chiaro
     if insecure:
         client.tls_set(cert_reqs=ssl.CERT_NONE)     # NON verifica il certificato
         client.tls_insecure_set(True)
@@ -328,13 +530,17 @@ def make_client(insecure):
 
 
 def main():
+    global SEND_INTERVAL, TERMINAL_DWELL, CRUISE_KMH, SIM_STEP
+
     ap = argparse.ArgumentParser(description="Simulatore bus CassiTrack -> MQTT")
     ap.add_argument("file", help="file JSON delle linee (es. percorso1.json)")
     ap.add_argument("--insecure", action="store_true",
                     help="salta la verifica del certificato TLS")
-    ap.add_argument("--send-interval", type=float, default=60.0,
+    ap.add_argument("--send-interval", type=float, default=SEND_INTERVAL,
                     metavar="SEC",
-                    help="secondi tra due invii MQTT per ciascun bus (default: 60)")
+                    help=f"secondi tra due invii MQTT per ciascun bus "
+                         f"(default: {SEND_INTERVAL:.0f}; sotto i 15 s l'aggancio "
+                         f"alle fermate di CassiTrack e' affidabile)")
     ap.add_argument("--terminal-dwell", type=float, default=180.0,
                     metavar="SEC",
                     help="sosta ai capolinea prima dell'inversione, in secondi (default: 180)")
@@ -344,9 +550,30 @@ def main():
     ap.add_argument("--sim-step", type=float, default=1.0,
                     metavar="SEC",
                     help="passo interno di simulazione in secondi (default: 1)")
+    ap.add_argument("--id-map", default=ID_MAP_FILE, metavar="FILE",
+                    help=f"traduzione id percorso -> id veicolo CassiTrack "
+                         f"(default: {ID_MAP_FILE}; se manca, gli id restano invariati)")
+    ap.add_argument("--schedule", default=SCHEDULE_FILE, metavar="FILE",
+                    help=f"tabellario CassiTrack da rispettare "
+                         f"(default: {SCHEDULE_FILE}; se manca, marcia continua)")
+    ap.add_argument("--free-running", action="store_true",
+                    help="ignora il tabellario: marcia continua avanti e indietro")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="simula e stampa senza connettersi al broker MQTT")
+    # Broker configurabile: serve per provare la simulazione contro
+    # un'installazione locale di CassiTrack senza toccare quella di produzione.
+    ap.add_argument("--broker", default=BROKER, metavar="HOST",
+                    help=f"host del broker MQTT (default: {BROKER})")
+    ap.add_argument("--port", type=int, default=PORT, metavar="PORTA",
+                    help=f"porta del broker (default: {PORT})")
+    ap.add_argument("--user", default=USER, metavar="UTENTE",
+                    help=f"utente MQTT (default: {USER})")
+    ap.add_argument("--password", default=PASSWORD, metavar="PWD",
+                    help="password MQTT")
+    ap.add_argument("--no-tls", action="store_true",
+                    help="connessione in chiaro, per un broker locale senza TLS")
     args = ap.parse_args()
 
-    global SEND_INTERVAL, TERMINAL_DWELL, CRUISE_KMH, SIM_STEP
     SEND_INTERVAL  = args.send_interval
     TERMINAL_DWELL = args.terminal_dwell
     CRUISE_KMH     = args.cruise_kmh
@@ -354,20 +581,53 @@ def main():
 
     with open(args.file, "r", encoding="utf-8") as f:
         data = json.load(f)
-    buses = [Bus(b) for b in data.get("buses", []) if len(b.get("points", [])) >= 2]
+
+    id_map   = load_id_map(args.id_map)
+    schedule = {} if args.free_running else load_schedule(args.schedule)
+
+    buses, esclusi = [], []
+    for spec in data.get("buses", []):
+        if len(spec.get("points", [])) < 2:
+            continue
+        sid = spec["id"]
+        # La mappa e' esplicita: un id assente resta invariato, un id associato
+        # a null e' un percorso che NON va simulato (lo coprono le antenne vere).
+        if sid in id_map and not id_map[sid]:
+            esclusi.append(sid)
+            continue
+        pub_id = id_map.get(sid) or sid
+        buses.append(Bus(spec, pub_id=pub_id, trips=schedule.get(pub_id)))
+
     if not buses:
         print("Nessun bus valido nel file (servono almeno 2 punti per linea).")
         sys.exit(1)
 
-    client = make_client(args.insecure)
-    print(f"Connessione a {BROKER}:{PORT} ...")
-    client.connect(BROKER, PORT, keepalive=60)
-    client.loop_start()
+    client = None
+    if args.dry_run:
+        print("Modalita' dry-run: nessuna connessione al broker, solo stampa.")
+    else:
+        client = make_client(args.insecure, args.user, args.password,
+                             tls=not args.no_tls)
+        print(f"Connessione a {args.broker}:{args.port} "
+              f"({'TLS' if not args.no_tls else 'in chiaro'}) ...")
+        client.connect(args.broker, args.port, keepalive=60)
+        client.loop_start()
 
+    in_orario = sum(1 for b in buses if b.trips)
     print(f"Avvio simulazione di {len(buses)} bus. Premi Ctrl+C per fermare.")
     print(f"  invio MQTT ....... 1 ogni {SEND_INTERVAL:.0f} s per bus")
-    print(f"  velocita' ........ {CRUISE_KMH:.0f} km/h (+/-{SPEED_JITTER*100:.0f}%)")
-    print(f"  sosta capolinea .. {TERMINAL_DWELL:.0f} s, poi inversione di marcia")
+    if in_orario:
+        print(f"  orario ........... {in_orario} veicoli seguono il tabellario "
+              f"({args.schedule}); velocita' dedotta da ogni corsa")
+    else:
+        print(f"  velocita' ........ {CRUISE_KMH:.0f} km/h (+/-{SPEED_JITTER*100:.0f}%)")
+        print(f"  sosta capolinea .. {TERMINAL_DWELL:.0f} s, poi inversione di marcia")
+    senza = [b.id for b in buses if not b.trips]
+    if senza and in_orario:
+        print(f"  senza orario ..... {', '.join(senza)} (marcia continua)")
+    if esclusi:
+        print(f"  esclusi .......... {', '.join(esclusi)} "
+              f"(linea servita dalle antenne fisiche)")
     print(f"  passo simulazione. {SIM_STEP:.2f} s\n")
     threads = [threading.Thread(target=run_bus, args=(b, client), daemon=True) for b in buses]
     for t in threads:
@@ -382,8 +642,9 @@ def main():
         _stop.set()
         for t in threads:
             t.join(timeout=2)
-        client.loop_stop()
-        client.disconnect()
+        if client is not None:
+            client.loop_stop()
+            client.disconnect()
         print("Simulazione terminata.")
 
 

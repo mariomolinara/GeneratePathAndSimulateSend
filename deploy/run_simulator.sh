@@ -18,7 +18,8 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 PYTHON="${SIM_PYTHON:-$PROJECT_DIR/.venv/bin/python}"
-JSON="${SIM_JSON:-percorsiCassino.json}"
+# I percorsi di settembre 2026 sono quelli coperti da vehicle_ids.json.
+JSON="${SIM_JSON:-percorsiCassinoSettembre2026.json}"
 LOCKFILE="${SIM_LOCK:-/tmp/cassitrack-sim.lock}"
 
 if [[ ! -x "$PYTHON" ]]; then
