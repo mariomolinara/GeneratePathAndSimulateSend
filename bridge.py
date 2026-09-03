@@ -16,7 +16,7 @@ senza dover modificare il broker.
 Uso:
     pip install paho-mqtt websockets
     python bridge.py
-    python bridge.py --insecure          # salta verifica cert TLS del broker
+    python bridge.py --insecure          # salta verifica cert TLS del broker.
     python bridge.py --ws-port 9000      # cambia porta del server WebSocket
 """
 
